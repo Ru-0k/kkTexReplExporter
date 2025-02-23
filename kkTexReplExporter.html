@@ -1,0 +1,508 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.0/jszip.min.js"></script>
+  <title>角色卡贴图替换 by R菌</title>
+  <style>
+    body {
+      margin: 0;
+      padding: 0;
+    }
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      background: #f0f0f0;
+      padding: 10px 20px;
+      border-bottom: 1px solid #ccc;
+    }
+    header h1 {
+      margin: 0;
+      font-size: 24px;
+    }
+    header a {
+      text-decoration: none;
+      color: blue;
+      font-size: 16px;
+    }
+    #toolbar {
+      position: fixed;
+      bottom: 0;
+      background: white;
+      padding: 10px;
+      border-top: 1px solid #ccc;
+      width: 100%;
+      z-index: 1000;
+    }
+    .thumbnail-container {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin: 80px 10px 100px; /* 留出 header 和 toolbar 的空间 */
+    }
+    .thumbnail-item {
+      border: 1px solid #ddd;
+      padding: 5px;
+      position: relative;
+      text-align: center;
+      width: 256px;
+    }
+    .thumbnail-img {
+      max-width: 256px;
+      max-height: 256px;
+      display: block;
+      margin: 0 auto;
+    }
+    /* 序号显示在右上角，带阴影和半透明底纹 */
+    .file-index {
+      position: absolute;
+      top: 0;
+      right: 0;
+      background: rgba(0, 0, 0, 0.5);
+      color: white;
+      padding: 2px 4px;
+      font-weight: bold;
+      text-shadow: 1px 1px 2px black;
+    }
+    /* 复选框显示在左上角 */
+    .thumbnail-item input[type="checkbox"] {
+      position: absolute;
+      top: 0;
+      left: 0;
+      margin: 5px;
+      z-index: 10;
+    }
+    /* 新增：替换按钮样式（浮于缩略图左下角，样式与工具栏按钮类似，但字号稍小） */
+    .thumbnail-item .replace-button {
+      position: absolute;
+      bottom: 25px;
+      left: 5px;
+      padding: 1px 2px;
+      background-color: #f0f0f0;
+      border: 1px solid #ccc;
+      font-size: 12px;
+      cursor: pointer;
+      z-index: 10;
+    }
+    /* 修改：将图片信息区分为两行，保证数字上下对齐 */
+    .img-info div {
+      line-height: 1.4;
+    }
+
+  </style>
+</head>
+<body>
+  <header>
+    <h1>角色卡贴图替换</h1>
+    <a href="#" target="_blank">GitHub项目文件夹</a>
+  </header>
+  <div class="selection-panel">
+    <input type="file" id="fileInput" style="display: none;">
+    <button onclick="document.getElementById('fileInput').click()">读取文件</button>
+  </div>
+  <div class="thumbnail-container" id="thumbnailContainer"></div>
+  <div id="toolbar">
+    <button onclick="exportSelected()">导出选中</button>
+    <button onclick="updateOriginal()">另存新卡</button>
+  </div>
+
+<script>
+/* ======== 全局变量 ======== */
+let originalFileData = null;     // 原始文件的 Uint8Array 数据
+let fileName = "";
+let fileExt = "";
+let fileNameWithoutExtension = "";
+let idx = [];                    // 数组，每个元素为 [dummy, startIndex, endIndex]（idx[0]作为占位）
+let extractedImages = [];        // 每个元素保存 { index, originalData, replacementData }
+
+/* ======== 工具函数 ======== */
+// 将十六进制字符串转换为 Uint8Array
+function hexStringToUint8Array(hexString) {
+  if (hexString.length % 2 !== 0) throw "Invalid hexString";
+  let array = new Uint8Array(hexString.length / 2);
+  for (let i = 0; i < hexString.length; i += 2) {
+    array[i / 2] = parseInt(hexString.substr(i, 2), 16);
+  }
+  return array;
+}
+// 将多个 Uint8Array 拼接
+function concatUint8Arrays(arrays) {
+  let totalLength = arrays.reduce((acc, arr) => acc + arr.length, 0);
+  let result = new Uint8Array(totalLength);
+  let offset = 0;
+  arrays.forEach(arr => {
+    result.set(arr, offset);
+    offset += arr.length;
+  });
+  return result;
+}
+// 替换原数据中 [start, end) 处的片段，返回新 Uint8Array
+function replaceSegment(original, start, end, replacement) {
+  let before = original.slice(0, start);
+  let after = original.slice(end);
+  return concatUint8Arrays([before, replacement, after]);
+}
+// 在 haystack 数组中查找 needle 数组（从 fromIndex 到 toIndex）
+function indexOfSubarray(haystack, needle, fromIndex = 0, toIndex = haystack.length) {
+  for (let i = fromIndex; i <= toIndex - needle.length; i++) {
+    let found = true;
+    for (let j = 0; j < needle.length; j++) {
+      if (haystack[i + j] !== needle[j]) {
+        found = false;
+        break;
+      }
+    }
+    if (found) return i;
+  }
+  return -1;
+}
+// 从后向前查找子数组
+function lastIndexOfSubarray(haystack, needle, fromIndex = 0, toIndex = haystack.length) {
+  for (let i = toIndex - needle.length; i >= fromIndex; i--) {
+    let found = true;
+    for (let j = 0; j < needle.length; j++) {
+      if (haystack[i + j] !== needle[j]) {
+        found = false;
+        break;
+      }
+    }
+    if (found) return i;
+  }
+  return -1;
+}
+
+/* ======== getlen 函数 ======== */
+function getlen(lengthOfBytes, type) {
+  lengthOfBytes = parseInt(lengthOfBytes, 10);
+  if (lengthOfBytes < 0 || lengthOfBytes > 0xffffffff) {
+    throw new Error("Value out of range");
+  }
+  if (type !== undefined) {
+    if (type === 1) {
+      return { hexStr: "c4" + lengthOfBytes.toString(16).padStart(2, '0'), len: 1 };
+    } else if (type === 2) {
+      return { hexStr: "c5" + lengthOfBytes.toString(16).padStart(4, '0'), len: 2 };
+    } else if (type === 3 || type === 4) {
+      return { hexStr: "c6" + lengthOfBytes.toString(16).padStart(8, '0'), len: 4 };
+    } else {
+      throw new Error("Invalid type");
+    }
+  } else {
+    let hexStr = lengthOfBytes.toString(16).padStart(8, '0');
+    let bytesArr = [];
+    for (let i = 0; i < 8; i += 2) {
+      bytesArr.push(parseInt(hexStr.substr(i, 2), 16));
+    }
+    let index = -1;
+    for (let i = 0; i < bytesArr.length; i++) {
+      if (bytesArr[i] !== 0) { index = i; break; }
+    }
+    let computedType = 4 - index;
+    if (computedType === 1) {
+      return { hexStr: "c4" + lengthOfBytes.toString(16).padStart(2, '0'), len: 1 };
+    } else if (computedType === 2) {
+      return { hexStr: "c5" + lengthOfBytes.toString(16).padStart(4, '0'), len: 2 };
+    } else if (computedType === 3 || computedType === 4) {
+      return { hexStr: "c6" + lengthOfBytes.toString(16).padStart(8, '0'), len: 4 };
+    } else {
+      throw new Error("Computed type out of range");
+    }
+  }
+}
+
+/* ======== upd_idx 函数 ======== */
+function upd_idx(old_len, new_len, idxlist, pos, firstconf) {
+  let diff = new_len - old_len;
+  if (diff !== 0) {
+    for (let j = 0; j < 3; j++) {
+      idxlist[pos][j] += firstconf[j] * diff;
+    }
+    if (pos + 1 < idxlist.length) {
+      for (let i = pos + 1; i < idxlist.length; i++) {
+        for (let j = 0; j < 3; j++) {
+          idxlist[i][j] += diff;
+        }
+      }
+    }
+  }
+}
+
+/* ======== 定义各种标志 ======== */
+const start_marker = hexStringToUint8Array("89504e47");
+const end_marker = hexStringToUint8Array("ae426082");
+const txtrdic_marker = new TextEncoder().encode("TextureDictionary");
+const overlay_marker = new TextEncoder().encode("Overlays");
+
+/* ======== 文件读取和内嵌图片提取 ======== */
+document.getElementById("fileInput").addEventListener("change", function(event) {
+  const file = event.target.files[0];
+  if (!file) return;
+  
+  fileName = file.name;
+  fileExt = fileName.substring(fileName.lastIndexOf('.'));
+  fileNameWithoutExtension = fileName.substring(0, fileName.lastIndexOf('.'));
+  
+  const reader = new FileReader();
+  reader.onload = function(e) {
+    const arrayBuffer = e.target.result;
+    originalFileData = new Uint8Array(arrayBuffer);
+    
+    idx = [[0, 0, 0]];
+    extractedImages = [];
+    let count = 0;
+    let start_idx = 0;
+    
+    while (true) {
+      let startPos = indexOfSubarray(originalFileData, start_marker, start_idx, originalFileData.length);
+      let endPos = indexOfSubarray(originalFileData, end_marker, start_idx, originalFileData.length);
+      if (endPos !== -1) {
+        endPos += end_marker.length;
+      }
+      idx.push([0, startPos, endPos]);
+      
+      if (startPos !== -1 && endPos !== -1) {
+        count++;
+        let imageData = originalFileData.slice(startPos, endPos);
+        extractedImages.push({
+          index: count,
+          originalData: imageData,
+          replacementData: null
+        });
+        start_idx = endPos;
+      } else {
+        idx.pop();
+        break;
+      }
+    }
+    displayThumbnails();
+  };
+  reader.readAsArrayBuffer(file);
+});
+
+/* ======== 显示缩略图 ======== */
+function displayThumbnails() {
+  const container = document.getElementById("thumbnailContainer");
+  container.innerHTML = "";
+  
+  extractedImages.forEach(item => {
+    const div = document.createElement("div");
+    div.className = "thumbnail-item";
+    
+    // 复选框（浮动在左上角）
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.id = "checkbox-" + item.index;
+    div.appendChild(checkbox);
+    
+    // 序号显示（浮动在右上角，带阴影和半透明底纹）
+    const indexP = document.createElement("div");
+    indexP.className = "file-index";
+    indexP.textContent = item.index;
+    div.appendChild(indexP);
+    
+    // 图片显示
+    const img = document.createElement("img");
+    img.className = "thumbnail-img";
+    let blob = new Blob([item.originalData], { type: "image/png" });
+    img.src = URL.createObjectURL(blob);
+    div.appendChild(img);
+    
+    // 信息显示区域：显示原始图片信息和替换后图片信息（若有）
+    const infoDiv = document.createElement("div");
+    infoDiv.className = "img-info";
+    infoDiv.style.fontSize = "12px";
+    infoDiv.style.marginTop = "5px";
+
+    const originalInfoDiv = document.createElement("div");
+    originalInfoDiv.className = "original-info";
+    originalInfoDiv.textContent = "加载中...";
+
+    const replacementInfoDiv = document.createElement("div");
+    replacementInfoDiv.className = "replacement-info";
+    replacementInfoDiv.textContent = "";
+
+    infoDiv.appendChild(originalInfoDiv);
+    infoDiv.appendChild(replacementInfoDiv);
+    div.appendChild(infoDiv);
+    
+    // 工具函数：格式化文件大小
+    function formatSize(bytes) {
+      if (bytes < 1024) return bytes + " B";
+      else if (bytes < 1023488) return (bytes / 1024).toPrecision(3) + " kB";
+      else return (bytes / (1024 * 1024)).toPrecision(3) + " MB";
+    }
+    
+    // 图片加载后更新原始信息，并处理放大逻辑：最长边小于256px时按比例放大至256px
+    img.onload = function() {
+      if (!item.replacementData) {
+        // **原始图片逻辑：若最长边小于 256px，则按比例放大**
+        const maxSide = Math.max(img.naturalWidth, img.naturalHeight);
+        if (maxSide < 256) {
+          let factor = 256 / maxSide;
+          img.style.width = (img.naturalWidth * factor) + "px";
+          img.style.height = (img.naturalHeight * factor) + "px";
+        } else {
+          img.style.width = "";
+          img.style.height = "";
+        }
+        originalInfoDiv.textContent = `${img.naturalWidth}x${img.naturalHeight}, ${formatSize(item.originalData.length)}`;
+      } else {
+        // **新导入的图片：按原始比例显示，不应用放大逻辑**
+        img.style.width = "";
+        img.style.height = "";
+        replacementInfoDiv.textContent = `替换: ${img.naturalWidth}x${img.naturalHeight}, ${formatSize(item.replacementData.length)}`;
+      }
+    };
+    
+    // 替换按钮：文件输入隐藏，通过 label 显示按钮文字“替换”
+    const replaceLabel = document.createElement("label");
+    replaceLabel.className = "replace-button";
+    replaceLabel.textContent = "替换";
+    const replaceInput = document.createElement("input");
+    replaceInput.type = "file";
+    replaceInput.style.display = "none";
+    replaceInput.addEventListener("change", function(e) {
+      const f = e.target.files[0];
+      if (!f) return;
+      const fr = new FileReader();
+      fr.onload = function(ev) {
+        const newData = new Uint8Array(ev.target.result);
+        item.replacementData = newData;
+        let newBlob = new Blob([newData], { type: "image/png" });
+        img.src = URL.createObjectURL(newBlob);
+        // 更新替换后信息，新信息显示在新的一行
+        replacementInfoDiv.textContent = `替换: ${img.naturalWidth}x${img.naturalHeight}, ${formatSize(newData.length)}`;
+      };
+      fr.readAsArrayBuffer(f);
+    });
+    replaceLabel.appendChild(replaceInput);
+    div.appendChild(replaceLabel);
+    
+    container.appendChild(div);
+  });
+}
+
+/* ======== “导出选中” 按钮处理 ======== */
+function exportSelected() {
+  const selectedItems = extractedImages.filter(item => {
+    const checkbox = document.getElementById("checkbox-" + item.index);
+    return checkbox && checkbox.checked;
+  });
+  if (selectedItems.length <= 3) {
+    selectedItems.forEach(item => {
+      let dataToExport = item.replacementData ? item.replacementData : item.originalData;
+      const blob = new Blob([dataToExport], { type: "image/png" });
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = `${fileNameWithoutExtension}_${item.index.toString().padStart(3, '0')}${fileExt}`;
+      a.click();
+      URL.revokeObjectURL(a.href);
+    });
+  } else {
+    // 使用 JSZip 打包下载（需先引入 JSZip 库）
+    let zip = new JSZip();
+    selectedItems.forEach(item => {
+      let dataToExport = item.replacementData ? item.replacementData : item.originalData;
+      const fileNameToSave = `${fileNameWithoutExtension}_${item.index.toString().padStart(3, '0')}${fileExt}`;
+      zip.file(fileNameToSave, dataToExport);
+    });
+    zip.generateAsync({type:"blob"}).then(function(content) {
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(content);
+      a.download = `${fileNameWithoutExtension}_export.zip`;
+      a.click();
+      URL.revokeObjectURL(a.href);
+    });
+  }
+}
+
+
+/* ======== “另存新文件”按钮处理 ======== */
+function updateOriginal() {
+  // 复制原始文件数据
+  let overwrt_data = originalFileData.slice();
+  // 深拷贝 idx 数组（每个子数组单独拷贝）
+  let idx_new = idx.map(item => item.slice());
+  let bank_count = 0;
+  let count_endi = 0;
+  let count = extractedImages.length; // idx[0] 为占位
+  
+  // 从最后一个内嵌图片开始替换
+  for (let i = count; i >= 1; i--) {
+    // 若用户替换了此图片，则使用替换数据，否则使用原数据
+    let replacementData = extractedImages[i - 1].replacementData || extractedImages[i - 1].originalData;
+    let oldLength = idx[i][2] - idx[i][1];
+    let newLength = replacementData.length;
+    overwrt_data = replaceSegment(overwrt_data, idx[i][1], idx[i][2], replacementData);
+    upd_idx(oldLength, newLength, idx_new, i, [0, 0, 1]);
+    
+    if (i > 2) {
+      // 更新内嵌图片长度标志
+      let { hexStr: old_len_marker, len: old_len_offset } = getlen(oldLength);
+      idx[i][0] = idx[i][1] - old_len_offset - 1;
+      idx_new[i][0] = idx[i][0];
+      let { hexStr: new_len_marker, len: new_len_offset } = getlen(newLength);
+      let new_len_bytes = hexStringToUint8Array(new_len_marker);
+      overwrt_data = replaceSegment(overwrt_data, idx_new[i][1] - old_len_offset - 1, idx_new[i][1] - old_len_offset + old_len_offset, new_len_bytes);
+      upd_idx(old_len_offset, new_len_offset, idx_new, i, [0, 1, 1]);
+    }
+    
+    // 检查此内嵌图片前是否有贴图库或纹理库的起始标志
+    let searchStart = idx_new[i - 1][2];
+    let searchEnd = idx_new[i][1];
+    let segment = overwrt_data.slice(searchStart, searchEnd);
+    let txtrdic_rel = lastIndexOfSubarray(segment, txtrdic_marker, 0, segment.length);
+    let overlay_rel = lastIndexOfSubarray(segment, overlay_marker, 0, segment.length);
+    let txtrdic_idx_final = txtrdic_rel !== -1 ? searchStart + txtrdic_rel : -1;
+    let overlay_idx_final = overlay_rel !== -1 ? searchStart + overlay_rel : -1;
+    if (txtrdic_idx_final !== -1 || overlay_idx_final !== -1) {
+      debugger;
+      if (txtrdic_idx_final !== -1 && overlay_idx_final !== -1) {
+        alert("同时找到TextureDictionary和Overlays标志，处理出错！");
+        return;
+      }
+      let bank_idx = (txtrdic_idx_final !== -1 ? txtrdic_idx_final : 0) + (overlay_idx_final !== -1 ? overlay_idx_final : 0);
+      let banklen_idx;
+      if (txtrdic_idx_final !== -1) {
+        banklen_idx = bank_idx + txtrdic_marker.length;
+      } else if (overlay_idx_final !== -1) {
+        banklen_idx = bank_idx + overlay_marker.length;
+      }
+      let bankend_idx;
+      if (bank_count === 0) {
+        bankend_idx = idx_new[idx_new.length - 1][2];
+      } else {
+        bankend_idx = idx_new[count_endi][2];
+      }
+      let bank_byte = overwrt_data[banklen_idx];
+      let old_len_offset_bank = Math.pow(2, bank_byte - 0xc4);
+      let bankstart_idx = banklen_idx + 1 + old_len_offset_bank;
+      let bank_data_length = bankend_idx - bankstart_idx + (overlay_idx_final !== -1 ? 1 : 0);
+      let { hexStr: bank_new_marker, len: bank_new_len_offset } = getlen(bank_data_length);
+      let bank_new_marker_bytes = hexStringToUint8Array(bank_new_marker);
+      overwrt_data = replaceSegment(overwrt_data, banklen_idx, banklen_idx + old_len_offset_bank + 1, bank_new_marker_bytes);
+      upd_idx(old_len_offset_bank, bank_new_len_offset, idx_new, i, [1, 1, 1]);
+      count_endi = i - 1;
+      bank_count++;
+    }
+    
+    if (i === 2) { // 针对证件照的特殊处理
+      let hexVal = newLength.toString(16).padStart(8, '0');
+      let data_len_buf = hexStringToUint8Array(hexVal);
+      data_len_buf = data_len_buf.reverse(); // 反转字节顺序
+      overwrt_data = replaceSegment(overwrt_data, idx_new[i][1] - 4, idx_new[i][1], data_len_buf);
+    }
+  }
+  let newFileName = `${fileNameWithoutExtension}_replaced${fileExt}`;
+  const blob = new Blob([overwrt_data], { type: "application/octet-stream" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = newFileName;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+</script>
+</body>
+</html>
