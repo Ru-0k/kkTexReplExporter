@@ -73,7 +73,7 @@
       margin: 5px;
       z-index: 10;
     }
-    /* 新增：替换按钮样式（浮于缩略图左下角，样式与工具栏按钮类似，但字号稍小） */
+    /* 替换按钮样式（浮于缩略图左下角） */
     .thumbnail-item .replace-button {
       position: absolute;
       bottom: 25px;
@@ -85,7 +85,7 @@
       cursor: pointer;
       z-index: 10;
     }
-    /* 修改：将图片信息区分为两行，保证数字上下对齐 */
+    /* 图片信息区分为两行 */
     .img-info div {
       line-height: 1.4;
     }
@@ -114,22 +114,20 @@ let fileName = "";
 let fileExt = "";
 let fileNameWithoutExtension = "";
 
-// textures：合并了原 idx 与 extractedImages 的统一结构体数组
-// 每个元素：
+// textures：每个元素：
 //   {
-//     lenPos:       number,     // msgpack 长度标志的位置（"special"/"id_photo"类为0，暂不使用）
-//     start:        number,     // PNG 数据起始位置
-//     end:          number,     // PNG 数据末尾位置（不含）
-//     cat:          string,     // 类别："special" | "id_photo" | "TextureDictionary" | "Overlays"
-//     bankFirst:    boolean,    // 是否是某个贴图库的第一个贴图
-//     index:        number,     // 序号（1-based，用于显示和导出文件名）
-//     originalData: Uint8Array, // 原始 PNG 数据
-//     replacementData: Uint8Array|null  // 用户选择的替换 PNG 数据
+//     lenPos:          number,           // getlen()标志位置；id_photo为大小标志起始；special为0
+//     start:           number,           // 图片数据起始位置
+//     end:             number,           // 图片数据末尾位置（不含）
+//     cat:             string,           // "special" | "id_photo" | "TextureDictionary" | "Overlays" | "standalone"
+//     bankFirst:       boolean,          // 是否是库内第一个贴图（紧随库大小标志之后）
+//     index:           number,           // 序号（1-based，用于显示和导出）
+//     originalData:    Uint8Array,       // 原始图片数据
+//     replacementData: Uint8Array|null   // 用户选择的替换图片数据
 //   }
 let textures = [];
 
 /* ======== 工具函数 ======== */
-// 将十六进制字符串转换为 Uint8Array
 function hexStringToUint8Array(hexString) {
   if (hexString.length % 2 !== 0) throw "Invalid hexString";
   let array = new Uint8Array(hexString.length / 2);
@@ -138,115 +136,145 @@ function hexStringToUint8Array(hexString) {
   }
   return array;
 }
-// 将多个 Uint8Array 拼接
+
 function concatUint8Arrays(arrays) {
   let totalLength = arrays.reduce((acc, arr) => acc + arr.length, 0);
   let result = new Uint8Array(totalLength);
   let offset = 0;
-  arrays.forEach(arr => {
-    result.set(arr, offset);
-    offset += arr.length;
-  });
+  arrays.forEach(arr => { result.set(arr, offset); offset += arr.length; });
   return result;
 }
-// 替换原数据中 [start, end) 处的片段，返回新 Uint8Array
+
 function replaceSegment(original, start, end, replacement) {
-  let before = original.slice(0, start);
-  let after = original.slice(end);
-  return concatUint8Arrays([before, replacement, after]);
+  return concatUint8Arrays([original.slice(0, start), replacement, original.slice(end)]);
 }
-// 在 haystack 数组中查找 needle 数组（从 fromIndex 到 toIndex）
+
 function indexOfSubarray(haystack, needle, fromIndex = 0, toIndex = haystack.length) {
   for (let i = fromIndex; i <= toIndex - needle.length; i++) {
     let found = true;
     for (let j = 0; j < needle.length; j++) {
-      if (haystack[i + j] !== needle[j]) {
-        found = false;
-        break;
-      }
-    }
-    if (found) return i;
-  }
-  return -1;
-}
-// 从后向前查找子数组
-function lastIndexOfSubarray(haystack, needle, fromIndex = 0, toIndex = haystack.length) {
-  for (let i = toIndex - needle.length; i >= fromIndex; i--) {
-    let found = true;
-    for (let j = 0; j < needle.length; j++) {
-      if (haystack[i + j] !== needle[j]) {
-        found = false;
-        break;
-      }
+      if (haystack[i + j] !== needle[j]) { found = false; break; }
     }
     if (found) return i;
   }
   return -1;
 }
 
-/* ======== getlen 函数 ======== */
+function lastIndexOfSubarray(haystack, needle, fromIndex = 0, toIndex = haystack.length) {
+  for (let i = toIndex - needle.length; i >= fromIndex; i--) {
+    let found = true;
+    for (let j = 0; j < needle.length; j++) {
+      if (haystack[i + j] !== needle[j]) { found = false; break; }
+    }
+    if (found) return i;
+  }
+  return -1;
+}
+
+// 读取 getlen() 格式的长度标志（c4/c5/c6 + 1/2/4字节大端序长度值）
+// 返回 { value: 长度数值, lenBytes: 长度字节数（不含类型字节） }
+function readGetlen(data, pos) {
+  const typeByte = data[pos];
+  if (typeByte < 0xc4 || typeByte > 0xc6) {
+    throw new Error(`readGetlen: 非法类型字节 0x${typeByte.toString(16)}（位置 ${pos}）`);
+  }
+  const lenBytes = Math.pow(2, typeByte - 0xc4); // c4→1, c5→2, c6→4
+  let value = 0;
+  for (let i = 0; i < lenBytes; i++) {
+    value = value * 256 + data[pos + 1 + i]; // 大端序
+  }
+  return { value, lenBytes };
+}
+
+// 查找 _TextureID_\d{4} 模式，返回该模式起始位置，未找到则返回 -1
+function findTextureIDMarker(data, fromIndex) {
+  for (let i = fromIndex; i <= data.length - TEXTURE_ID_TOTAL_LEN; i++) {
+    let match = true;
+    for (let j = 0; j < textureID_prefix.length; j++) {
+      if (data[i + j] !== textureID_prefix[j]) { match = false; break; }
+    }
+    if (!match) continue;
+    let digitsOk = true;
+    for (let k = 0; k < 4; k++) {
+      const b = data[i + textureID_prefix.length + k];
+      if (b < 0x30 || b > 0x39) { digitsOk = false; break; }
+    }
+    if (digitsOk) return i;
+  }
+  return -1;
+}
+
+// 从图片数据的魔数检测 MIME 类型（png / jpeg / webp）
+function getImageMimeType(data) {
+  if (data.length >= 4 &&
+      data[0] === 0x89 && data[1] === 0x50 && data[2] === 0x4E && data[3] === 0x47) {
+    return "image/png";
+  }
+  if (data.length >= 3 &&
+      data[0] === 0xFF && data[1] === 0xD8 && data[2] === 0xFF) {
+    return "image/jpeg";
+  }
+  if (data.length >= 12 &&
+      data[0] === 0x52 && data[1] === 0x49 && data[2] === 0x46 && data[3] === 0x46 &&
+      data[8] === 0x57 && data[9] === 0x45 && data[10] === 0x42 && data[11] === 0x50) {
+    return "image/webp";
+  }
+  return "image/png"; // 兜底
+}
+
+// 根据图片数据的魔数返回对应扩展名
+function getImageExtension(data) {
+  const mime = getImageMimeType(data);
+  if (mime === "image/jpeg") return ".jpg";
+  if (mime === "image/webp") return ".webp";
+  return ".png";
+}
+
+/* ======== getlen 函数（用于生成写入用的长度标志） ======== */
 function getlen(lengthOfBytes, type) {
   lengthOfBytes = parseInt(lengthOfBytes, 10);
   if (lengthOfBytes < 0 || lengthOfBytes > 0xffffffff) {
     throw new Error("Value out of range");
   }
   if (type !== undefined) {
-    if (type === 1) {
-      return { hexStr: "c4" + lengthOfBytes.toString(16).padStart(2, '0'), len: 1 };
-    } else if (type === 2) {
-      return { hexStr: "c5" + lengthOfBytes.toString(16).padStart(4, '0'), len: 2 };
-    } else if (type === 3 || type === 4) {
-      return { hexStr: "c6" + lengthOfBytes.toString(16).padStart(8, '0'), len: 4 };
-    } else {
-      throw new Error("Invalid type");
-    }
-  } else {
-    let hexStr = lengthOfBytes.toString(16).padStart(8, '0');
-    let bytesArr = [];
-    for (let i = 0; i < 8; i += 2) {
-      bytesArr.push(parseInt(hexStr.substr(i, 2), 16));
-    }
-    let index = -1;
-    for (let i = 0; i < bytesArr.length; i++) {
-      if (bytesArr[i] !== 0) { index = i; break; }
-    }
-    let computedType = 4 - index;
-    if (computedType === 1) {
-      return { hexStr: "c4" + lengthOfBytes.toString(16).padStart(2, '0'), len: 1 };
-    } else if (computedType === 2) {
-      return { hexStr: "c5" + lengthOfBytes.toString(16).padStart(4, '0'), len: 2 };
-    } else if (computedType === 3 || computedType === 4) {
-      return { hexStr: "c6" + lengthOfBytes.toString(16).padStart(8, '0'), len: 4 };
-    } else {
-      throw new Error("Computed type out of range");
-    }
+    if (type === 1) return { hexStr: "c4" + lengthOfBytes.toString(16).padStart(2, '0'), len: 1 };
+    if (type === 2) return { hexStr: "c5" + lengthOfBytes.toString(16).padStart(4, '0'), len: 2 };
+    if (type === 3 || type === 4) return { hexStr: "c6" + lengthOfBytes.toString(16).padStart(8, '0'), len: 4 };
+    throw new Error("Invalid type");
   }
+  let hexStr = lengthOfBytes.toString(16).padStart(8, '0');
+  let bytesArr = [];
+  for (let i = 0; i < 8; i += 2) bytesArr.push(parseInt(hexStr.substr(i, 2), 16));
+  let index = -1;
+  for (let i = 0; i < bytesArr.length; i++) { if (bytesArr[i] !== 0) { index = i; break; } }
+  const computedType = 4 - index;
+  if (computedType === 1) return { hexStr: "c4" + lengthOfBytes.toString(16).padStart(2, '0'), len: 1 };
+  if (computedType === 2) return { hexStr: "c5" + lengthOfBytes.toString(16).padStart(4, '0'), len: 2 };
+  if (computedType === 3 || computedType === 4) return { hexStr: "c6" + lengthOfBytes.toString(16).padStart(8, '0'), len: 4 };
+  throw new Error("Computed type out of range");
 }
 
 /* ======== upd_idx 函数 ======== */
 // firstconf 对应 ["lenPos", "start", "end"] 三个字段的更新开关
 function upd_idx(old_len, new_len, texList, pos, firstconf) {
   const keys = ["lenPos", "start", "end"];
-  let diff = new_len - old_len;
+  const diff = new_len - old_len;
   if (diff !== 0) {
-    for (let j = 0; j < 3; j++) {
-      texList[pos][keys[j]] += firstconf[j] * diff;
-    }
-    for (let i = pos + 1; i < texList.length; i++) {
-      for (let j = 0; j < 3; j++) {
-        texList[i][keys[j]] += diff;
-      }
-    }
+    for (let j = 0; j < 3; j++) texList[pos][keys[j]] += firstconf[j] * diff;
+    for (let i = pos + 1; i < texList.length; i++)
+      for (let j = 0; j < 3; j++) texList[i][keys[j]] += diff;
   }
 }
 
-/* ======== 定义各种标志 ======== */
-const start_marker = hexStringToUint8Array("89504e47");
-const end_marker = hexStringToUint8Array("ae426082");
-const txtrdic_marker = new TextEncoder().encode("TextureDictionary");
-const overlay_marker = new TextEncoder().encode("Overlays");
+/* ======== 标志定义 ======== */
+const start_marker      = hexStringToUint8Array("89504e47"); // PNG 起始
+const end_marker        = hexStringToUint8Array("ae426082"); // PNG 结尾
+const txtrdic_marker    = new TextEncoder().encode("TextureDictionary");
+const overlay_marker    = new TextEncoder().encode("Overlays");
+const textureID_prefix  = new TextEncoder().encode("_TextureID_"); // 散图片标志前缀
+const TEXTURE_ID_TOTAL_LEN = textureID_prefix.length + 4;          // _TextureID_ + 4位数字 = 15字节
 
-/* ======== 文件读取和内嵌贴图提取 ======== */
+/* ======== 文件读取与贴图扫描 ======== */
 document.getElementById("fileInput").addEventListener("change", function(event) {
   const file = event.target.files[0];
   if (!file) return;
@@ -257,61 +285,109 @@ document.getElementById("fileInput").addEventListener("change", function(event) 
 
   const reader = new FileReader();
   reader.onload = function(e) {
-    const arrayBuffer = e.target.result;
-    originalFileData = new Uint8Array(arrayBuffer);
-
+    originalFileData = new Uint8Array(e.target.result);
     textures = [];
-    let start_idx = 0;
 
-    while (true) {
-      let startPos = indexOfSubarray(originalFileData, start_marker, start_idx, originalFileData.length);
-      // 用 lastIndexOfSubarray 从当前位置向后找最近的结束标志，防止误匹配
-      let endPos = indexOfSubarray(originalFileData, end_marker, start_idx, originalFileData.length);
-      if (endPos !== -1) endPos += end_marker.length;
+    // ── 1. 卡面（第一个 PNG，无大小标志，必须是 PNG）──────────────────────
+    const cfStart = indexOfSubarray(originalFileData, start_marker, 0);
+    const cfEndRaw = indexOfSubarray(originalFileData, end_marker, 0);
+    if (cfStart === -1 || cfEndRaw === -1) { displayThumbnails(); return; }
+    const cfEnd = cfEndRaw + end_marker.length;
 
-      if (startPos === -1 || endPos === -1 || endPos <= startPos) break;
+    textures.push({
+      lenPos: 0, start: cfStart, end: cfEnd,
+      cat: "special", bankFirst: false, index: 1,
+      originalData: originalFileData.slice(cfStart, cfEnd),
+      replacementData: null
+    });
 
-      const texNum = textures.length + 1; // 1-based
-      let cat, bankFirst;
+    // ── 2. 证件照（第二个 PNG，4字节小端序大小标志，必须是 PNG）──────────
+    const idStart = indexOfSubarray(originalFileData, start_marker, cfEnd);
+    const idEndRaw = indexOfSubarray(originalFileData, end_marker, cfEnd);
+    if (idStart === -1 || idEndRaw === -1) { displayThumbnails(); return; }
+    const idEnd = idEndRaw + end_marker.length;
 
-      if (texNum === 1) {
-        cat = "special";
-        bankFirst = false;
-      } else if (texNum === 2) {
-        cat = "id_photo";  // 证件照，长度字节序与其他不同
-        bankFirst = false;
-      } else {
-        // 在上一个贴图末尾到当前贴图起始之间，查找库标志
-        const prevEnd = textures[textures.length - 1].end;
-        const gap = originalFileData.slice(prevEnd, startPos);
-        const txFound = lastIndexOfSubarray(gap, txtrdic_marker, 0, gap.length) !== -1;
-        const ovFound = lastIndexOfSubarray(gap, overlay_marker, 0, gap.length) !== -1;
-        if (txFound) {
-          cat = "TextureDictionary";
-          bankFirst = true;
-        } else if (ovFound) {
-          cat = "Overlays";
-          bankFirst = true;
+    textures.push({
+      lenPos: idStart - 4, start: idStart, end: idEnd,
+      cat: "id_photo", bankFirst: false, index: 2,
+      originalData: originalFileData.slice(idStart, idEnd),
+      replacementData: null
+    });
+
+    // ── 3+. 纹理库、贴图库、散图片（getlen() 大小标志，png/jpg/webp）──────
+    let scanPos = idEnd;
+
+    try {
+      while (scanPos < originalFileData.length) {
+        // 在当前位置后分别查找三种标志，取最近的一个
+        const txPos = indexOfSubarray(originalFileData, txtrdic_marker, scanPos);
+        const ovPos = indexOfSubarray(originalFileData, overlay_marker, scanPos);
+        const tiPos = findTextureIDMarker(originalFileData, scanPos);
+
+        const candidates = [];
+        if (txPos !== -1) candidates.push({ pos: txPos, type: "TextureDictionary" });
+        if (ovPos !== -1) candidates.push({ pos: ovPos, type: "Overlays" });
+        if (tiPos !== -1) candidates.push({ pos: tiPos, type: "standalone" });
+        if (candidates.length === 0) break;
+
+        candidates.sort((a, b) => a.pos - b.pos);
+        const nearest = candidates[0];
+
+        if (nearest.type === "standalone") {
+          // 散图片：_TextureID_XXXX + getlen() + 图片数据
+          const lenPos = tiPos + TEXTURE_ID_TOTAL_LEN;
+          const { value: imgSize, lenBytes } = readGetlen(originalFileData, lenPos);
+          const imgStart = lenPos + 1 + lenBytes;
+          const imgEnd   = imgStart + imgSize;
+
+          textures.push({
+            lenPos, start: imgStart, end: imgEnd,
+            cat: "standalone", bankFirst: false,
+            index: textures.length + 1,
+            originalData: originalFileData.slice(imgStart, imgEnd),
+            replacementData: null
+          });
+
+          scanPos = imgEnd;
+
         } else {
-          // 继承上一个贴图的类别（同一个库内的连续贴图）
-          cat = textures[textures.length - 1].cat;
-          bankFirst = false;
+          // 库（TextureDictionary 或 Overlays）：
+          //   [库名] [getlen():库大小] [图片1 getlen():大小] [图片1数据] [图片2...] [0xc2 仅Overlays]
+          const marker = nearest.type === "TextureDictionary" ? txtrdic_marker : overlay_marker;
+          const banklenPos = nearest.pos + marker.length;
+          const { value: bankSize, lenBytes: bankLenBytes } = readGetlen(originalFileData, banklenPos);
+          const bankContentStart = banklenPos + 1 + bankLenBytes;
+          const bankEnd          = bankContentStart + bankSize;
+
+          // Overlays 库内容末尾有一字节 0xc2，不属于任何图片
+          const imgScanEnd = nearest.type === "Overlays" ? bankEnd - 1 : bankEnd;
+
+          let imgPos  = bankContentStart;
+          let isFirst = true;
+
+          while (imgPos < imgScanEnd) {
+            const { value: imgSize, lenBytes: imgLenBytes } = readGetlen(originalFileData, imgPos);
+            const imgStart = imgPos + 1 + imgLenBytes;
+            const imgEnd   = imgStart + imgSize;
+
+            textures.push({
+              lenPos: imgPos, start: imgStart, end: imgEnd,
+              cat: nearest.type, bankFirst: isFirst,
+              index: textures.length + 1,
+              originalData: originalFileData.slice(imgStart, imgEnd),
+              replacementData: null
+            });
+
+            isFirst = false;
+            imgPos  = imgEnd;
+          }
+
+          scanPos = bankEnd;
         }
       }
-
-      const imageData = originalFileData.slice(startPos, endPos);
-      textures.push({
-        lenPos: 0,
-        start: startPos,
-        end: endPos,
-        cat: cat,
-        bankFirst: bankFirst,
-        index: texNum,
-        originalData: imageData,
-        replacementData: null
-      });
-
-      start_idx = endPos;
+    } catch (err) {
+      console.error("贴图扫描出错：", err);
+      // 出错前已扫描到的贴图仍正常显示
     }
 
     displayThumbnails();
@@ -328,26 +404,26 @@ function displayThumbnails() {
     const div = document.createElement("div");
     div.className = "thumbnail-item";
 
-    // 复选框（浮动在左上角）
+    // 复选框（左上角）
     const checkbox = document.createElement("input");
     checkbox.type = "checkbox";
     checkbox.id = "checkbox-" + item.index;
     div.appendChild(checkbox);
 
-    // 序号显示（浮动在右上角，带阴影和半透明底纹）
+    // 序号（右上角）
     const indexP = document.createElement("div");
     indexP.className = "file-index";
     indexP.textContent = item.index;
     div.appendChild(indexP);
 
-    // 图片显示
+    // 图片
     const img = document.createElement("img");
     img.className = "thumbnail-img";
-    let blob = new Blob([item.originalData], { type: "image/png" });
-    img.src = URL.createObjectURL(blob);
+    const origMime = getImageMimeType(item.originalData);
+    img.src = URL.createObjectURL(new Blob([item.originalData], { type: origMime }));
     div.appendChild(img);
 
-    // 信息显示区域：显示原始图片信息和替换后图片信息（若有）
+    // 信息区
     const infoDiv = document.createElement("div");
     infoDiv.className = "img-info";
     infoDiv.style.fontSize = "12px";
@@ -365,41 +441,38 @@ function displayThumbnails() {
     infoDiv.appendChild(replacementInfoDiv);
     div.appendChild(infoDiv);
 
-    // 工具函数：格式化文件大小
     function formatSize(bytes) {
       if (bytes < 1024) return bytes + " B";
       else if (bytes < 1023488) return (bytes / 1024).toPrecision(3) + " kB";
       else return (bytes / (1024 * 1024)).toPrecision(3) + " MB";
     }
 
-    // 图片加载后更新原始信息，并处理放大逻辑：最长边小于256px时按比例放大至256px
     img.onload = function() {
       if (!item.replacementData) {
-        // 原始图片逻辑：若最长边小于 256px，则按比例放大
         const maxSide = Math.max(img.naturalWidth, img.naturalHeight);
         if (maxSide < 256) {
-          let factor = 256 / maxSide;
-          img.style.width = (img.naturalWidth * factor) + "px";
+          const factor = 256 / maxSide;
+          img.style.width  = (img.naturalWidth  * factor) + "px";
           img.style.height = (img.naturalHeight * factor) + "px";
         } else {
-          img.style.width = "";
-          img.style.height = "";
+          img.style.width = img.style.height = "";
         }
-        originalInfoDiv.textContent = `${img.naturalWidth}x${img.naturalHeight}, ${formatSize(item.originalData.length)}`;
+        originalInfoDiv.textContent =
+          `${img.naturalWidth}x${img.naturalHeight}, ${formatSize(item.originalData.length)}`;
       } else {
-        // 新导入的图片：按原始比例显示，不应用放大逻辑
-        img.style.width = "";
-        img.style.height = "";
-        replacementInfoDiv.textContent = `替换: ${img.naturalWidth}x${img.naturalHeight}, ${formatSize(item.replacementData.length)}`;
+        img.style.width = img.style.height = "";
+        replacementInfoDiv.textContent =
+          `替换: ${img.naturalWidth}x${img.naturalHeight}, ${formatSize(item.replacementData.length)}`;
       }
     };
 
-    // 替换按钮：文件输入隐藏，通过 label 显示按钮文字"替换"
+    // 替换按钮
     const replaceLabel = document.createElement("label");
     replaceLabel.className = "replace-button";
     replaceLabel.textContent = "替换";
     const replaceInput = document.createElement("input");
     replaceInput.type = "file";
+    replaceInput.accept = "image/png,image/jpeg,image/webp";
     replaceInput.style.display = "none";
     replaceInput.addEventListener("change", function(e) {
       const f = e.target.files[0];
@@ -408,10 +481,10 @@ function displayThumbnails() {
       fr.onload = function(ev) {
         const newData = new Uint8Array(ev.target.result);
         item.replacementData = newData;
-        let newBlob = new Blob([newData], { type: "image/png" });
-        img.src = URL.createObjectURL(newBlob);
-        // 更新替换后信息，新信息显示在新的一行
-        replacementInfoDiv.textContent = `替换: ${img.naturalWidth}x${img.naturalHeight}, ${formatSize(newData.length)}`;
+        const newMime = getImageMimeType(newData);
+        img.src = URL.createObjectURL(new Blob([newData], { type: newMime }));
+        replacementInfoDiv.textContent =
+          `替换: ${img.naturalWidth}x${img.naturalHeight}, ${formatSize(newData.length)}`;
       };
       fr.readAsArrayBuffer(f);
     });
@@ -422,31 +495,32 @@ function displayThumbnails() {
   });
 }
 
-/* ======== "导出选中" 按钮处理 ======== */
+/* ======== "导出选中" 按钮 ======== */
 function exportSelected() {
   const selectedItems = textures.filter(item => {
-    const checkbox = document.getElementById("checkbox-" + item.index);
-    return checkbox && checkbox.checked;
+    const cb = document.getElementById("checkbox-" + item.index);
+    return cb && cb.checked;
   });
+
   if (selectedItems.length <= 3) {
     selectedItems.forEach(item => {
-      let dataToExport = item.replacementData ? item.replacementData : item.originalData;
-      const blob = new Blob([dataToExport], { type: "image/png" });
+      const data = item.replacementData || item.originalData;
+      const blob = new Blob([data], { type: getImageMimeType(data) });
+      const ext  = getImageExtension(data);
       const a = document.createElement("a");
       a.href = URL.createObjectURL(blob);
-      a.download = `${fileNameWithoutExtension}_${item.index.toString().padStart(3, '0')}${fileExt}`;
+      a.download = `${fileNameWithoutExtension}_${item.index.toString().padStart(3, '0')}${ext}`;
       a.click();
       URL.revokeObjectURL(a.href);
     });
   } else {
-    // 使用 JSZip 打包下载（需先引入 JSZip 库）
     let zip = new JSZip();
     selectedItems.forEach(item => {
-      let dataToExport = item.replacementData ? item.replacementData : item.originalData;
-      const fileNameToSave = `${fileNameWithoutExtension}_${item.index.toString().padStart(3, '0')}${fileExt}`;
-      zip.file(fileNameToSave, dataToExport);
+      const data = item.replacementData || item.originalData;
+      const ext  = getImageExtension(data);
+      zip.file(`${fileNameWithoutExtension}_${item.index.toString().padStart(3, '0')}${ext}`, data);
     });
-    zip.generateAsync({type:"blob"}).then(function(content) {
+    zip.generateAsync({ type: "blob" }).then(function(content) {
       const a = document.createElement("a");
       a.href = URL.createObjectURL(content);
       a.download = `${fileNameWithoutExtension}_export.zip`;
@@ -456,86 +530,94 @@ function exportSelected() {
   }
 }
 
-
-/* ======== "另存新文件"按钮处理 ======== */
+/* ======== "另存新卡" 按钮 ======== */
 function updateOriginal() {
-  // 复制原始文件数据
   let overwrt_data = originalFileData.slice();
-  // 深拷贝 textures 数组（每个元素的数值字段单独拷贝，data 引用共享即可）
   let textures_new = textures.map(t => Object.assign({}, t));
   let bank_count = 0;
   let count_endi = 0;
   const count = textures.length;
 
-  // 从最后一个内嵌贴图开始替换
   for (let i = count - 1; i >= 0; i--) {
     const tex = textures[i];
-    // 若用户替换了此贴图，则使用替换数据，否则使用原数据
-    let replacementData = tex.replacementData || tex.originalData;
-    let oldLength = tex.end - tex.start;
-    let newLength = replacementData.length;
+    const replacementData = tex.replacementData || tex.originalData;
+    const oldLength = tex.end - tex.start;
+    const newLength = replacementData.length;
+
+    // 替换图片数据
     overwrt_data = replaceSegment(overwrt_data, textures_new[i].start, textures_new[i].end, replacementData);
     upd_idx(oldLength, newLength, textures_new, i, [0, 0, 1]);
 
+    // 更新图片自身的 getlen() 大小标志
+    // 适用于库内图片（TextureDictionary/Overlays）和散图片（standalone）
     if (tex.cat !== "special" && tex.cat !== "id_photo") {
-      // 更新该贴图的 msgpack 长度标志
-      let { hexStr: old_len_marker, len: old_len_offset } = getlen(oldLength);
-      textures[i].lenPos = tex.start - old_len_offset - 1;
+      const { len: old_len_offset } = getlen(oldLength);
+      textures[i].lenPos     = tex.start - old_len_offset - 1;
       textures_new[i].lenPos = textures[i].lenPos;
-      let { hexStr: new_len_marker, len: new_len_offset } = getlen(newLength);
-      let new_len_bytes = hexStringToUint8Array(new_len_marker);
-      overwrt_data = replaceSegment(overwrt_data, textures_new[i].start - old_len_offset - 1, textures_new[i].start - old_len_offset + old_len_offset, new_len_bytes);
+
+      const { hexStr: new_len_marker, len: new_len_offset } = getlen(newLength);
+      const new_len_bytes = hexStringToUint8Array(new_len_marker);
+      overwrt_data = replaceSegment(
+        overwrt_data,
+        textures_new[i].start - old_len_offset - 1,
+        textures_new[i].start,
+        new_len_bytes
+      );
       upd_idx(old_len_offset, new_len_offset, textures_new, i, [0, 1, 1]);
     }
 
-    // 若该贴图是某个库的首个贴图，则需对该库的长度标志作对应修改
+    // 若该图片是某个库的首个图片，则更新该库的 getlen() 大小标志
+    // 散图片（standalone）的 bankFirst 为 false，不触发此分支
     if (tex.bankFirst) {
       const bank_marker = tex.cat === "TextureDictionary" ? txtrdic_marker : overlay_marker;
 
-      // 在前一个贴图末尾到当前贴图起始之间搜索库标志
-      let searchStart = i > 0 ? textures_new[i - 1].end : 0;
-      let searchEnd = textures_new[i].start;
-      let segment = overwrt_data.slice(searchStart, searchEnd);
-      let bank_rel = lastIndexOfSubarray(segment, bank_marker, 0, segment.length);
-      if (bank_rel === -1) {
-        alert("未找到库标志，处理出错！");
-        return;
-      }
-      let bank_idx = searchStart + bank_rel;
-      let banklen_idx = bank_idx + bank_marker.length;
+      const searchStart = i > 0 ? textures_new[i - 1].end : 0;
+      const searchEnd   = textures_new[i].start;
+      const segment     = overwrt_data.slice(searchStart, searchEnd);
+      const bank_rel    = lastIndexOfSubarray(segment, bank_marker, 0, segment.length);
+      if (bank_rel === -1) { alert("未找到库标志，处理出错！"); return; }
 
-      let bankend_idx;
-      if (bank_count === 0) {
-        bankend_idx = textures_new[textures_new.length - 1].end;
-      } else {
-        bankend_idx = textures_new[count_endi].end;
-      }
+      const bank_idx    = searchStart + bank_rel;
+      const banklen_idx = bank_idx + bank_marker.length;
 
-      let bank_byte = overwrt_data[banklen_idx];
-      let old_len_offset_bank = Math.pow(2, bank_byte - 0xc4);
-      let bankstart_idx = banklen_idx + 1 + old_len_offset_bank;
-      let bank_data_length = bankend_idx - bankstart_idx + (tex.cat === "Overlays" ? 1 : 0);
-      let { hexStr: bank_new_marker, len: bank_new_len_offset } = getlen(bank_data_length);
-      let bank_new_marker_bytes = hexStringToUint8Array(bank_new_marker);
-      overwrt_data = replaceSegment(overwrt_data, banklen_idx, banklen_idx + old_len_offset_bank + 1, bank_new_marker_bytes);
+      const bankend_idx = bank_count === 0
+        ? textures_new[textures_new.length - 1].end
+        : textures_new[count_endi].end;
+
+      const old_len_offset_bank = Math.pow(2, overwrt_data[banklen_idx] - 0xc4);
+      const bankstart_idx       = banklen_idx + 1 + old_len_offset_bank;
+      const bank_data_length    = bankend_idx - bankstart_idx + (tex.cat === "Overlays" ? 1 : 0);
+
+      const { hexStr: bank_new_marker, len: bank_new_len_offset } = getlen(bank_data_length);
+      overwrt_data = replaceSegment(
+        overwrt_data,
+        banklen_idx,
+        banklen_idx + old_len_offset_bank + 1,
+        hexStringToUint8Array(bank_new_marker)
+      );
       upd_idx(old_len_offset_bank, bank_new_len_offset, textures_new, i, [1, 1, 1]);
+
       count_endi = i - 1;
       bank_count++;
     }
 
-    if (tex.cat === "id_photo") { // 针对证件照的特殊处理
-      let hexVal = newLength.toString(16).padStart(8, '0');
-      let data_len_buf = hexStringToUint8Array(hexVal);
-      data_len_buf = data_len_buf.reverse(); // 反转字节顺序
-      overwrt_data = replaceSegment(overwrt_data, textures_new[i].start - 4, textures_new[i].start, data_len_buf);
+    // 证件照：4字节小端序大小标志
+    if (tex.cat === "id_photo") {
+      const data_len_buf = hexStringToUint8Array(newLength.toString(16).padStart(8, '0')).reverse();
+      overwrt_data = replaceSegment(
+        overwrt_data,
+        textures_new[i].start - 4,
+        textures_new[i].start,
+        data_len_buf
+      );
     }
   }
-  let newFileName = `${fileNameWithoutExtension}_replaced${fileExt}`;
+
   const blob = new Blob([overwrt_data], { type: "application/octet-stream" });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = newFileName;
+  const url  = URL.createObjectURL(blob);
+  const a    = document.createElement("a");
+  a.href     = url;
+  a.download = `${fileNameWithoutExtension}_replaced${fileExt}`;
   a.click();
   URL.revokeObjectURL(url);
 }
