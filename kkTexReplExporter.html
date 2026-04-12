@@ -526,11 +526,11 @@ function displayThumbnails() {
           img.style.width = img.style.height = "";
         }
         originalInfoDiv.textContent =
-          `${img.naturalWidth}x${img.naturalHeight}, ${formatSize(item.originalData.length)}`;
+          `${img.naturalWidth}x${img.naturalHeight}, ${formatSize(item.originalData.length)}, ${getImageExtension(item.originalData).slice(1)}`;
       } else {
         img.style.width = img.style.height = "";
         replacementInfoDiv.textContent =
-          `替换: ${img.naturalWidth}x${img.naturalHeight}, ${formatSize(item.replacementData.length)}`;
+          `替换: ${img.naturalWidth}x${img.naturalHeight}, ${formatSize(item.replacementData.length)}, ${getImageExtension(item.replacementData).slice(1)}`;
       }
     };
 
@@ -552,7 +552,7 @@ function displayThumbnails() {
         const newMime = getImageMimeType(newData);
         img.src = URL.createObjectURL(new Blob([newData], { type: newMime }));
         replacementInfoDiv.textContent =
-          `替换: ${img.naturalWidth}x${img.naturalHeight}, ${formatSize(newData.length)}`;
+          `替换: ${img.naturalWidth}x${img.naturalHeight}, ${formatSize(newData.length)}, ${getImageExtension(newData).slice(1)}`;
       };
       fr.readAsArrayBuffer(f);
     });
