@@ -204,6 +204,66 @@ function findTextureIDMarker(data, fromIndex) {
   return -1;
 }
 
+// 查找有效的库标志（紧跟其后的字节必须是 c4/c5/c6，否则视为误匹配继续搜索）
+function findValidLibraryMarker(data, marker, fromPos) {
+  let searchPos = fromPos;
+  while (true) {
+    const pos = indexOfSubarray(data, marker, searchPos);
+    if (pos === -1) return -1;
+    const afterMarker = pos + marker.length;
+    const typeByte = data[afterMarker];
+    if (typeByte === 0xc4 || typeByte === 0xc5 || typeByte === 0xc6) return pos;
+    searchPos = pos + 1; // 该处是误匹配，从下一个字节继续搜索
+  }
+}
+
+// 在 [fromPos, toPos) 范围内查找所有图片起始位置（PNG/JPEG/WEBP 魔数）
+function findAllImageStarts(data, fromPos, toPos) {
+  const starts = [];
+  for (let i = fromPos; i < toPos; i++) {
+    // PNG: 89 50 4E 47
+    if (i + 4 <= toPos &&
+        data[i]===0x89 && data[i+1]===0x50 && data[i+2]===0x4E && data[i+3]===0x47) {
+      starts.push(i);
+    }
+    // JPEG: FF D8 FF
+    else if (i + 3 <= toPos &&
+        data[i]===0xFF && data[i+1]===0xD8 && data[i+2]===0xFF) {
+      starts.push(i);
+    }
+    // WEBP: 52 49 46 46 ?? ?? ?? ?? 57 45 42 50
+    else if (i + 12 <= toPos &&
+        data[i]===0x52 && data[i+1]===0x49 && data[i+2]===0x46 && data[i+3]===0x46 &&
+        data[i+8]===0x57 && data[i+9]===0x45 && data[i+10]===0x42 && data[i+11]===0x50) {
+      starts.push(i);
+    }
+  }
+  return starts;
+}
+
+// 在图片起始位置之前寻找紧贴的 getlen() 类型字节（c4/c5/c6）
+// bankContentStart: lenPos 不得低于此值；bankEnd: imgEnd 不得超过此值
+// 返回 { lenPos, value }，未找到则返回 null
+function findGetlenBefore(data, imgStart, bankContentStart, bankEnd) {
+  // 尝试 c4（1字节长度），lenPos = imgStart - 2
+  if (imgStart - 2 >= bankContentStart && data[imgStart - 2] === 0xc4) {
+    const value = data[imgStart - 1];
+    if (imgStart + value <= bankEnd) return { lenPos: imgStart - 2, value };
+  }
+  // 尝试 c5（2字节长度），lenPos = imgStart - 3
+  if (imgStart - 3 >= bankContentStart && data[imgStart - 3] === 0xc5) {
+    const value = data[imgStart - 2] * 0x100 + data[imgStart - 1];
+    if (imgStart + value <= bankEnd) return { lenPos: imgStart - 3, value };
+  }
+  // 尝试 c6（4字节长度），lenPos = imgStart - 5
+  if (imgStart - 5 >= bankContentStart && data[imgStart - 5] === 0xc6) {
+    const value = data[imgStart - 4] * 0x1000000 + data[imgStart - 3] * 0x10000 +
+                  data[imgStart - 2] * 0x100 + data[imgStart - 1];
+    if (imgStart + value <= bankEnd) return { lenPos: imgStart - 5, value };
+  }
+  return null;
+}
+
 // 从图片数据的魔数检测 MIME 类型（png / jpeg / webp）
 function getImageMimeType(data) {
   if (data.length >= 4 &&
@@ -320,8 +380,9 @@ document.getElementById("fileInput").addEventListener("change", function(event) 
     try {
       while (scanPos < originalFileData.length) {
         // 在当前位置后分别查找三种标志，取最近的一个
-        const txPos = indexOfSubarray(originalFileData, txtrdic_marker, scanPos);
-        const ovPos = indexOfSubarray(originalFileData, overlay_marker, scanPos);
+        // 库标志必须紧跟有效的 getlen() 类型字节（c4/c5/c6），否则视为误匹配
+        const txPos = findValidLibraryMarker(originalFileData, txtrdic_marker, scanPos);
+        const ovPos = findValidLibraryMarker(originalFileData, overlay_marker, scanPos);
         const tiPos = findTextureIDMarker(originalFileData, scanPos);
 
         const candidates = [];
@@ -362,16 +423,23 @@ document.getElementById("fileInput").addEventListener("change", function(event) 
           // Overlays 库内容末尾有一字节 0xc2，不属于任何图片
           const imgScanEnd = nearest.type === "Overlays" ? bankEnd - 1 : bankEnd;
 
-          let imgPos  = bankContentStart;
+          // 库内图片之间（以及库大小标志之后、第一张图之前）可能存在任意数据，
+          // 不能按顺序逐个读取 getlen()，需通过魔数定位每张图片的起始位置
+          const imgStarts = findAllImageStarts(originalFileData, bankContentStart, imgScanEnd);
           let isFirst = true;
+          let lastImgEnd = bankContentStart;
 
-          while (imgPos < imgScanEnd) {
-            const { value: imgSize, lenBytes: imgLenBytes } = readGetlen(originalFileData, imgPos);
-            const imgStart = imgPos + 1 + imgLenBytes;
-            const imgEnd   = imgStart + imgSize;
+          for (const imgStart of imgStarts) {
+            // 跳过落在已处理图片数据内的误匹配魔数
+            if (imgStart < lastImgEnd) continue;
+
+            const glenResult = findGetlenBefore(originalFileData, imgStart, bankContentStart, imgScanEnd);
+            if (glenResult === null) continue; // 无法找到紧贴的 getlen()，跳过此误匹配
+
+            const imgEnd = imgStart + glenResult.value;
 
             textures.push({
-              lenPos: imgPos, start: imgStart, end: imgEnd,
+              lenPos: glenResult.lenPos, start: imgStart, end: imgEnd,
               cat: nearest.type, bankFirst: isFirst,
               index: textures.length + 1,
               originalData: originalFileData.slice(imgStart, imgEnd),
@@ -379,7 +447,7 @@ document.getElementById("fileInput").addEventListener("change", function(event) 
             });
 
             isFirst = false;
-            imgPos  = imgEnd;
+            lastImgEnd = imgEnd;
           }
 
           scanPos = bankEnd;
